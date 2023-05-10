@@ -3,6 +3,7 @@ use rand::{
     Rng,
 };
 use std::{
+    collections::HashMap,
     error::Error,
     io::{stdin, stdout, StdoutLock, Write},
 };
@@ -12,13 +13,19 @@ use termion::{
     input::TermRead,
     raw::{IntoRawMode, RawTerminal},
     screen::{AlternateScreen, IntoAlternateScreen},
-    style,
+    style, terminal_size,
 };
+
+type RawOut<'a> = AlternateScreen<RawTerminal<StdoutLock<'a>>>;
+
+const COL_SEPARATOR: &str = "        ";
+const COL_SPACING: u16 = COL_SEPARATOR.len() as u16;
 
 const HEADER_COLOR: color::Fg<color::LightGreen> = color::Fg(color::LightGreen);
 const TITLE_COLOR: color::Fg<color::White> = color::Fg(color::White);
-const LIST_COLOR: color::Fg<color::LightBlack> = color::Fg(color::LightBlack);
-const POINTER_COLOR: color::Fg<color::White> = color::Fg(color::White);
+const LIST_COLOR: color::Fg<color::LightYellow> = color::Fg(color::LightYellow);
+const POINTER_FG_COLOR: color::Fg<color::White> = color::Fg(color::White);
+const POINTER_BG_COLOR: color::Bg<color::LightBlack> = color::Bg(color::LightBlack);
 const FOOTER_COLOR: color::Fg<color::LightBlue> = color::Fg(color::LightBlue);
 
 #[derive(Debug, Clone, Copy)]
@@ -28,100 +35,88 @@ enum Direction {
 }
 
 #[derive(Debug, Clone, Copy)]
-struct Positions {
+struct Layout {
     header: (u16, u16),
-    title: (u16, u16),
-    list_top: (u16, u16),
+    name: (u16, u16),
+    size: (u16, u16),
+    hash: (u16, u16),
+    top_item: (u16, u16),
     footer: (u16, u16),
 }
 
-impl Positions {
-    fn new(list: (u16, u16), border: (u16, u16)) -> Self {
-        // TODO: if list.0 > (terminal.0 - border.0) => wrap
+impl Layout {
+    fn new(widths: (usize, usize, usize), n: usize, w: usize, border: (u16, u16)) -> Self {
+        let half_w = terminal_size().unwrap().0 / 2;
+        let cent = half_w - (w as f32 * 0.5).round() as u16;
+
+        let header = (cent, border.1);
+        let name = (cent, border.1 + 3);
+        let size = (name.0 + widths.0 as u16 + COL_SPACING, border.1 + 3);
+        let hash = (size.0 + widths.1 as u16 + COL_SPACING, border.1 + 3);
+        let top_item = (cent - 4, border.1 + 5);
+        let footer = (cent, border.1 + n as u16 + 7);
 
         Self {
-            header: (border.0, border.1),
-            title: (border.0, border.1 + 3),
-            list_top: (border.0, border.1 + 5),
-            footer: (border.0, border.0 + list.1 + 2),
+            header,
+            name,
+            size,
+            hash,
+            top_item,
+            footer,
         }
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 struct Interface {
     pointer: (u16, u16),
-    data: Vec<String>,
-    list_len: usize,
+    filenames: Vec<String>,
+    display: Vec<(String, bool)>,
+    lay: Layout,
+    n: usize,
     index: usize,
-    pos: Positions,
 }
 
 impl Interface {
-    pub fn new(data: Vec<String>) -> Result<Self, Box<dyn Error>> {
-        let list_len = data.len();
-        let list_w = data
-            .iter()
-            .max_by(|x, y| x.len().cmp(&y.len()))
-            .unwrap()
-            .len();
-        let positions = Positions::new((list_w as u16, data.len() as u16), (6, 2));
+    pub fn new(data: HashMap<String, (u64, String)>) -> Result<Self, Box<dyn Error>> {
+        let widths = widths(&data);
+        let display = display(&data, &widths);
+        let n = display.len();
+        let w = display[0].0.len();
+        let filenames = data.keys().cloned().collect();
+        let lay = Layout::new(widths, n, w, (10, 2));
+        let pointer = lay.top_item;
 
         Ok(Self {
-            pointer: positions.list_top,
-            data,
-            list_len,
+            pointer,
+            filenames,
+            display,
+            lay,
+            n,
             index: 0,
-            pos: positions,
         })
     }
 
     pub fn run(&mut self) -> Result<(), Box<dyn Error>> {
         let stdin = stdin();
-        let mut stdout = stdout()
-            .lock()
-            .into_raw_mode()
-            .unwrap()
-            .into_alternate_screen()
-            .unwrap();
+        let mut stdout = stdout().lock().into_raw_mode()?.into_alternate_screen()?;
 
         self.clear(&mut stdout)?;
 
         // header
-        write!(
-            stdout,
-            "{}{}{}Connected to the server at 123.1.2.3:8080{}",
-            cursor::Goto(self.pos.header.0, self.pos.header.1),
+        let header = format!(
+            "{}{}Connected to the server at 123.1.2.3:8080",
             style::Bold,
-            HEADER_COLOR,
-            style::Reset
-        )?;
-
-        // title
-        write!(
-            stdout,
-            "{}{}{}Available files:{}",
-            cursor::Goto(self.pos.title.0, self.pos.title.1),
-            style::Bold,
-            TITLE_COLOR,
-            style::Reset
-        )?;
+            HEADER_COLOR
+        );
+        self.write_line(&mut stdout, &self.lay.header, header)?;
 
         // list
         self.write_list(&mut stdout)?;
 
-        // footer (TODO: progress bar)
-        write!(
-            stdout,
-            "{}{}{}Downloading: {}, {} & {}...{}",
-            cursor::Goto(self.pos.footer.0, self.pos.footer.1),
-            style::Bold,
-            FOOTER_COLOR,
-            self.data[0],
-            self.data[1],
-            self.data[2],
-            style::Reset
-        )?;
+        // footer
+        let footer = format!("{}{}Press 'q' to quit", style::Bold, FOOTER_COLOR);
+        self.write_line(&mut stdout, &self.lay.footer, footer)?;
 
         stdout.flush()?;
 
@@ -130,18 +125,22 @@ impl Interface {
                 Key::Char('q') => break,
                 Key::Char('j') => {
                     if self.update_pointer(Direction::Down) {
-                        self.write_pointer(&mut stdout)?;
+                        self.set_pointer(&mut stdout)?;
                         self.clear_pointer(&mut stdout, Direction::Down)?;
                     }
                 }
                 Key::Char('k') => {
                     if self.update_pointer(Direction::Up) {
-                        self.write_pointer(&mut stdout)?;
+                        self.set_pointer(&mut stdout)?;
                         self.clear_pointer(&mut stdout, Direction::Up)?;
                     }
                 }
+                Key::Char(' ') => {
+                    self.display[self.index].1 = !self.display[self.index].1;
+                    self.set_pointer(&mut stdout)?;
+                }
                 Key::Char('\n') => {
-                    todo!("gray out the current file")
+                    // TODO: send the request i.e. start the dl with progress_bar
                 }
                 _ => {}
             };
@@ -152,85 +151,105 @@ impl Interface {
         Ok(())
     }
 
-    fn clear(
-        &self,
-        stdout: &mut AlternateScreen<RawTerminal<StdoutLock>>,
-    ) -> Result<(), Box<dyn Error>> {
+    fn clear(&self, stdout: &mut RawOut) -> Result<(), Box<dyn Error>> {
         write!(stdout, "{}{}", clear::All, cursor::Hide)?;
 
         Ok(())
     }
 
-    fn write_list(
+    fn write_line(
         &self,
-        stdout: &mut AlternateScreen<RawTerminal<StdoutLock>>,
+        stdout: &mut RawOut,
+        pos: &(u16, u16),
+        text: String,
     ) -> Result<(), Box<dyn Error>> {
-        let this_data = self.data.clone();
-        let list_pos = self.pos.list_top;
+        write!(
+            stdout,
+            "{}{}{}",
+            cursor::Goto(pos.0, pos.1),
+            text,
+            style::Reset
+        )?;
 
-        this_data.iter().enumerate().for_each(|(i, item)| {
-            write!(
-                stdout,
-                "{}{}{}{}",
-                cursor::Goto(list_pos.0, list_pos.1 + i as u16),
+        Ok(())
+    }
+
+    fn write_list(&self, stdout: &mut RawOut) -> Result<(), Box<dyn Error>> {
+        // titles
+        let name = format!("{}{}Name", style::Italic, TITLE_COLOR);
+        let size = format!("{}{}Size", style::Italic, TITLE_COLOR);
+        let hash = format!("{}{}SHA-256", style::Italic, TITLE_COLOR);
+        self.write_line(stdout, &self.lay.name, name)?;
+        self.write_line(stdout, &self.lay.size, size)?;
+        self.write_line(stdout, &self.lay.hash, hash)?;
+
+        // items
+        for (i, d) in self.display.iter().enumerate() {
+            let line = format!(
+                "{}[{}] {}",
                 LIST_COLOR,
-                item,
-                style::Reset
-            )
-            .unwrap();
-        });
+                match d.1 {
+                    true => "x",
+                    false => " ",
+                },
+                d.0
+            );
+            let pos = (self.lay.top_item.0, self.lay.top_item.1 + i as u16);
+            self.write_line(stdout, &pos, line)?;
+        }
 
-        write!(stdout, "{}", cursor::Goto(list_pos.0, list_pos.1))?;
+        // focus to the first item
+        write!(stdout, "{}", cursor::Goto(self.pointer.0, self.pointer.1))?;
 
         Ok(())
     }
 
     fn clear_pointer(
         &self,
-        stdout: &mut AlternateScreen<RawTerminal<StdoutLock>>,
+        stdout: &mut RawOut,
         direction: Direction,
     ) -> Result<(), Box<dyn Error>> {
-        let (pos, item) = match direction {
+        let (pos, text) = match direction {
             Direction::Up => (
                 (self.pointer.0, self.pointer.1 + 1),
-                self.data[self.index + 1].clone(),
+                self.display[self.index + 1].clone(),
             ),
             Direction::Down => (
                 (self.pointer.0, self.pointer.1 - 1),
-                self.data[self.index - 1].clone(),
+                self.display[self.index - 1].clone(),
             ),
         };
 
-        write!(
-            stdout,
-            "{}{}{}{}{}",
-            cursor::Goto(pos.0, pos.1),
+        let new = format!(
+            "{}{}[{}] {}",
             clear::CurrentLine,
             LIST_COLOR,
-            item,
-            style::Reset,
-        )?;
-
+            match text.1 {
+                true => "x",
+                false => " ",
+            },
+            text.0
+        );
+        self.write_line(stdout, &pos, new)?;
         stdout.flush()?;
 
         Ok(())
     }
 
-    fn write_pointer(
-        &self,
-        stdout: &mut AlternateScreen<RawTerminal<StdoutLock>>,
-    ) -> Result<(), Box<dyn Error>> {
-        write!(
-            stdout,
-            "{}{}{}{} * {}{}",
-            cursor::Goto(self.pointer.0, self.pointer.1),
+    fn set_pointer(&self, stdout: &mut RawOut) -> Result<(), Box<dyn Error>> {
+        let new = format!(
+            "{}{}{}{}[{}] {}",
             clear::CurrentLine,
             style::Bold,
-            POINTER_COLOR,
-            self.data[self.index],
-            style::Reset
-        )?;
-
+            POINTER_BG_COLOR,
+            POINTER_FG_COLOR,
+            match self.display[self.index].1 {
+                true => "x",
+                false => " ",
+            },
+            self.display[self.index].0
+        );
+        self.write_line(stdout, &self.pointer, new)?;
         stdout.flush()?;
 
         Ok(())
@@ -239,7 +258,7 @@ impl Interface {
     fn update_pointer(&mut self, direction: Direction) -> bool {
         match direction {
             Direction::Up => {
-                if self.index > 0 && self.index <= self.list_len {
+                if self.index > 0 && self.index <= self.n {
                     self.pointer.1 -= 1;
                     self.index -= 1;
 
@@ -247,7 +266,7 @@ impl Interface {
                 }
             }
             Direction::Down => {
-                if self.index < self.list_len - 1 {
+                if self.index < self.n - 1 {
                     self.pointer.1 += 1;
                     self.index += 1;
 
@@ -260,14 +279,66 @@ impl Interface {
     }
 }
 
-fn rand_string() -> String {
-    let len = rand::thread_rng().gen_range(5..30);
+fn rand_string(limit: Option<usize>) -> String {
+    let len = match limit {
+        Some(limit) => limit,
+        None => rand::thread_rng().gen_range(5..30),
+    };
     Alphanumeric.sample_string(&mut rand::thread_rng(), len)
 }
 
+fn widths(data: &HashMap<String, (u64, String)>) -> (usize, usize, usize) {
+    let mut max_name = 0;
+    let mut max_size = 0;
+    let mut max_hash = 0;
+
+    data.iter().for_each(|(name, (size, hash))| {
+        if name.len() > max_name {
+            max_name = name.len();
+        }
+
+        if size.to_string().len() > max_size {
+            max_size = size.to_string().len();
+        }
+
+        if hash.len() > max_hash {
+            max_hash = hash.len();
+        }
+    });
+
+    (max_name, max_size, max_hash)
+}
+
+fn display(
+    data: &HashMap<String, (u64, String)>,
+    widths: &(usize, usize, usize),
+) -> Vec<(String, bool)> {
+    let mut display = Vec::new();
+
+    data.iter().for_each(|(name, (size, hash))| {
+        let mut d = String::new();
+
+        d.push_str(format!("{:width$}", name, width = widths.0).as_str());
+        d.push_str(COL_SEPARATOR);
+        d.push_str(format!("{:width$}", size, width = widths.1).as_str());
+        d.push_str(COL_SEPARATOR);
+        d.push_str(&format!("{}...", &hash[..20]));
+
+        display.push((d, false));
+    });
+
+    display
+}
+
 fn main() {
-    let mut data = Vec::new();
-    (0..15).into_iter().for_each(|_| data.push(rand_string()));
+    let mut data = HashMap::new();
+    (0..20).into_iter().for_each(|_| {
+        let filename = rand_string(None);
+        let filesize = rand::thread_rng().gen_range(100..1000000);
+        let hash = rand_string(Some(64));
+
+        data.insert(filename, (filesize, hash));
+    });
 
     let mut interface = Interface::new(data).unwrap();
     interface.run().unwrap();
