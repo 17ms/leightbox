@@ -2,21 +2,25 @@ use rand::{
     distributions::{Alphanumeric, DistString},
     Rng,
 };
+use signal_hook::{consts::SIGWINCH, iterator::Signals};
 use std::{
     collections::HashMap,
     error::Error,
-    io::{stdin, stdout, StdoutLock, Write},
+    io::{stdout, Read, StdoutLock, Write},
+    sync::mpsc::{self, Sender},
+    thread,
 };
 use termion::{
-    clear, color, cursor,
-    event::Key,
-    input::TermRead,
+    async_stdin, clear, color, cursor,
+    event::{parse_event, Event, Key},
     raw::{IntoRawMode, RawTerminal},
     screen::{AlternateScreen, IntoAlternateScreen},
     style, terminal_size,
 };
 
 type RawOut<'a> = AlternateScreen<RawTerminal<StdoutLock<'a>>>;
+
+const BORDER: (u16, u16) = (10, 2);
 
 const COL_SEPARATOR: &str = "        ";
 const COL_SPACING: u16 = COL_SEPARATOR.len() as u16;
@@ -72,8 +76,10 @@ struct Interface {
     pointer: (u16, u16),
     filenames: Vec<String>,
     display: Vec<(String, bool)>,
+    widths: (usize, usize, usize),
     lay: Layout,
     n: usize,
+    w: usize,
     index: usize,
 }
 
@@ -84,66 +90,71 @@ impl Interface {
         let n = display.len();
         let w = display[0].0.len();
         let filenames = data.keys().cloned().collect();
-        let lay = Layout::new(widths, n, w, (10, 2));
+        let lay = Layout::new(widths, n, w, BORDER);
         let pointer = lay.top_item;
 
         Ok(Self {
             pointer,
             filenames,
             display,
+            widths,
             lay,
             n,
+            w,
             index: 0,
         })
     }
 
     pub fn run(&mut self) -> Result<(), Box<dyn Error>> {
-        let stdin = stdin();
+        // use crossbeam-channel for better performance
+        let (winch_tx, winch_rx) = mpsc::channel::<()>();
+        thread::spawn(move || sigwinch_handler(winch_tx).unwrap());
+
+        let mut stdin = async_stdin().bytes();
         let mut stdout = stdout().lock().into_raw_mode()?.into_alternate_screen()?;
 
         self.clear(&mut stdout)?;
-
-        // header
-        let header = format!(
-            "{}{}Connected to the server at 123.1.2.3:8080",
-            style::Bold,
-            HEADER_COLOR
-        );
-        self.write_line(&mut stdout, &self.lay.header, header)?;
-
-        // list
-        self.write_list(&mut stdout)?;
-
-        // footer
-        let footer = format!("{}{}Press 'q' to quit", style::Bold, FOOTER_COLOR);
-        self.write_line(&mut stdout, &self.lay.footer, footer)?;
-
+        self.write_layout(&mut stdout)?;
         stdout.flush()?;
 
-        for c in stdin.keys() {
-            match c? {
-                Key::Char('q') => break,
-                Key::Char('j') => {
-                    if self.update_pointer(Direction::Down) {
-                        self.set_pointer(&mut stdout)?;
-                        self.clear_pointer(&mut stdout, Direction::Down)?;
+        // main event loop
+        loop {
+            let n = stdin.next();
+
+            if winch_rx.try_recv().is_ok() {
+                self.refresh_layout();
+                self.clear(&mut stdout)?;
+                self.write_layout(&mut stdout)?;
+                stdout.flush()?;
+            }
+
+            if let Some(Ok(k)) = n {
+                let e = parse_event(k, &mut stdin);
+
+                match e? {
+                    Event::Key(Key::Char('q')) => break,
+                    Event::Key(Key::Char('j')) => {
+                        if self.update_pointer(Direction::Down) {
+                            self.set_pointer(&mut stdout)?;
+                            self.clear_pointer(&mut stdout, Direction::Down)?;
+                        }
                     }
-                }
-                Key::Char('k') => {
-                    if self.update_pointer(Direction::Up) {
-                        self.set_pointer(&mut stdout)?;
-                        self.clear_pointer(&mut stdout, Direction::Up)?;
+                    Event::Key(Key::Char('k')) => {
+                        if self.update_pointer(Direction::Up) {
+                            self.set_pointer(&mut stdout)?;
+                            self.clear_pointer(&mut stdout, Direction::Up)?;
+                        }
                     }
+                    Event::Key(Key::Char(' ')) => {
+                        self.display[self.index].1 = !self.display[self.index].1;
+                        self.set_pointer(&mut stdout)?;
+                    }
+                    Event::Key(Key::Char('\n')) => {
+                        // TODO: send the request i.e. start the dl with progress_bar
+                    }
+                    _ => {}
                 }
-                Key::Char(' ') => {
-                    self.display[self.index].1 = !self.display[self.index].1;
-                    self.set_pointer(&mut stdout)?;
-                }
-                Key::Char('\n') => {
-                    // TODO: send the request i.e. start the dl with progress_bar
-                }
-                _ => {}
-            };
+            }
         }
 
         write!(stdout, "{}", cursor::Show).unwrap();
@@ -174,7 +185,24 @@ impl Interface {
         Ok(())
     }
 
-    fn write_list(&self, stdout: &mut RawOut) -> Result<(), Box<dyn Error>> {
+    fn refresh_layout(&mut self) {
+        let new_lay = Layout::new(self.widths, self.n, self.w, BORDER);
+        self.lay = new_lay;
+    }
+
+    fn write_layout(&self, stdout: &mut RawOut) -> Result<(), Box<dyn Error>> {
+        // header
+        let header = format!(
+            "{}{}Connected to the server at 123.1.2.3:8080",
+            style::Bold,
+            HEADER_COLOR
+        );
+        self.write_line(stdout, &self.lay.header, header)?;
+
+        // footer
+        let footer = format!("{}{}Press 'q' to quit", style::Bold, FOOTER_COLOR);
+        self.write_line(stdout, &self.lay.footer, footer)?;
+
         // titles
         let name = format!("{}{}Name", style::Italic, TITLE_COLOR);
         let size = format!("{}{}Size", style::Italic, TITLE_COLOR);
@@ -328,6 +356,17 @@ fn display(
     });
 
     display
+}
+
+fn sigwinch_handler(tx: Sender<()>) -> Result<(), Box<dyn Error>> {
+    // for contego's async context: tokio::signal::unix::{signal, SignalKind}
+    let mut signals = Signals::new([SIGWINCH])?;
+
+    for _ in &mut signals {
+        tx.send(())?;
+    }
+
+    Ok(())
 }
 
 fn main() {
