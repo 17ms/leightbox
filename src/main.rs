@@ -7,8 +7,9 @@ use std::{
     collections::HashMap,
     error::Error,
     io::{stdout, Read, StdoutLock, Write},
-    sync::mpsc::{self, Sender},
-    thread,
+    sync::mpsc::{self, Receiver, Sender},
+    thread::{self, JoinHandle},
+    time::Duration,
 };
 use termion::{
     async_stdin, clear, color, cursor,
@@ -74,7 +75,7 @@ impl Layout {
 #[derive(Clone)]
 struct Interface {
     pointer: (u16, u16),
-    filenames: Vec<String>,
+    data: HashMap<String, (u64, String)>,
     display: Vec<(String, bool)>,
     widths: (usize, usize, usize),
     lay: Layout,
@@ -89,13 +90,12 @@ impl Interface {
         let display = display(&data, &widths);
         let n = display.len();
         let w = display[0].0.len();
-        let filenames = data.keys().cloned().collect();
         let lay = Layout::new(widths, n, w, BORDER);
         let pointer = lay.top_item;
 
         Ok(Self {
             pointer,
-            filenames,
+            data,
             display,
             widths,
             lay,
@@ -113,6 +113,8 @@ impl Interface {
         let mut stdin = async_stdin().bytes();
         let mut stdout = stdout().lock().into_raw_mode()?.into_alternate_screen()?;
 
+        let mut dl_rx: Option<Receiver<()>> = None;
+
         self.clear(&mut stdout)?;
         self.write_layout(&mut stdout)?;
         stdout.flush()?;
@@ -126,6 +128,10 @@ impl Interface {
                 self.clear(&mut stdout)?;
                 self.write_layout(&mut stdout)?;
                 stdout.flush()?;
+            } else if let Some(rx) = &dl_rx {
+                if rx.try_recv().is_ok() {
+                    break;
+                }
             }
 
             if let Some(Ok(k)) = n {
@@ -150,7 +156,7 @@ impl Interface {
                         self.set_pointer(&mut stdout)?;
                     }
                     Event::Key(Key::Char('\n')) => {
-                        // TODO: send the request i.e. start the dl with progress_bar
+                        dl_rx = Some(self.init_dl(&mut stdout)?);
                     }
                     _ => {}
                 }
@@ -305,6 +311,29 @@ impl Interface {
 
         false
     }
+
+    fn init_dl(&self, stdout: &mut RawOut) -> Result<Receiver<()>, Box<dyn Error>> {
+        let footer = format!(
+            "{}{}Downloading the selected files...",
+            style::Bold,
+            FOOTER_COLOR
+        );
+        self.write_line(stdout, &self.lay.footer, footer)?;
+        stdout.flush()?;
+
+        let filenames: Vec<String> = self
+            .display
+            .iter()
+            .enumerate()
+            .filter(|(_, (_, b))| *b)
+            .map(|(i, _)| self.data.keys().nth(i).unwrap().clone())
+            .collect();
+
+        let (dl_tx, dl_rx) = mpsc::channel::<()>();
+        thread::spawn(move || download(&filenames, dl_tx).unwrap());
+
+        Ok(dl_rx)
+    }
 }
 
 fn rand_string(limit: Option<usize>) -> String {
@@ -365,6 +394,14 @@ fn sigwinch_handler(tx: Sender<()>) -> Result<(), Box<dyn Error>> {
     for _ in &mut signals {
         tx.send(())?;
     }
+
+    Ok(())
+}
+
+fn download(_filenames: &[String], tx: Sender<()>) -> Result<(), Box<dyn Error>> {
+    // mock function for sending client requests
+    thread::sleep(Duration::from_secs(5));
+    tx.send(())?;
 
     Ok(())
 }
