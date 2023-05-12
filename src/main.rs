@@ -8,7 +8,7 @@ use std::{
     error::Error,
     io::{stdout, Read, StdoutLock, Write},
     sync::mpsc::{self, Receiver, Sender},
-    thread::{self, JoinHandle},
+    thread::{self},
     time::Duration,
 };
 use termion::{
@@ -194,6 +194,8 @@ impl Interface {
     fn refresh_layout(&mut self) {
         let new_lay = Layout::new(self.widths, self.n, self.w, BORDER);
         self.lay = new_lay;
+        self.pointer = self.lay.top_item;
+        self.index = 0;
     }
 
     fn write_layout(&self, stdout: &mut RawOut) -> Result<(), Box<dyn Error>> {
