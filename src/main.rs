@@ -4,6 +4,7 @@ use rand::{
 };
 use signal_hook::{consts::SIGWINCH, iterator::Signals};
 use std::{
+    cmp::max,
     collections::HashMap,
     error::Error,
     io::{stdout, Read, StdoutLock, Write},
@@ -12,7 +13,9 @@ use std::{
     time::Duration,
 };
 use termion::{
-    async_stdin, clear, color, cursor,
+    async_stdin, clear,
+    color::{self, Bg, Fg},
+    cursor,
     event::{parse_event, Event, Key},
     raw::{IntoRawMode, RawTerminal},
     screen::{AlternateScreen, IntoAlternateScreen},
@@ -26,12 +29,12 @@ const BORDER: (u16, u16) = (10, 2);
 const COL_SEPARATOR: &str = "        ";
 const COL_SPACING: u16 = COL_SEPARATOR.len() as u16;
 
-const HEADER_COLOR: color::Fg<color::LightGreen> = color::Fg(color::LightGreen);
-const TITLE_COLOR: color::Fg<color::White> = color::Fg(color::White);
-const LIST_COLOR: color::Fg<color::LightYellow> = color::Fg(color::LightYellow);
-const POINTER_FG_COLOR: color::Fg<color::White> = color::Fg(color::White);
-const POINTER_BG_COLOR: color::Bg<color::LightBlack> = color::Bg(color::LightBlack);
-const FOOTER_COLOR: color::Fg<color::LightBlue> = color::Fg(color::LightBlue);
+const HEADER_COLOR: Fg<color::LightGreen> = Fg(color::LightGreen);
+const TITLE_COLOR: Fg<color::White> = Fg(color::White);
+const LIST_COLOR: Fg<color::LightYellow> = Fg(color::LightYellow);
+const POINTER_FG_COLOR: Fg<color::White> = Fg(color::White);
+const POINTER_BG_COLOR: Bg<color::LightBlack> = Bg(color::LightBlack);
+const FOOTER_COLOR: Fg<color::LightBlue> = Fg(color::LightBlue);
 
 #[derive(Debug, Clone, Copy)]
 enum Direction {
@@ -45,20 +48,20 @@ struct Layout {
     name: (u16, u16),
     size: (u16, u16),
     hash: (u16, u16),
-    top_item: (u16, u16),
+    list: (u16, u16),
     footer: (u16, u16),
 }
 
 impl Layout {
     fn new(widths: (usize, usize, usize), n: usize, w: usize, border: (u16, u16)) -> Self {
-        let half_w = terminal_size().unwrap().0 / 2;
-        let cent = half_w - (w as f32 * 0.5).round() as u16;
+        let mid = terminal_size().unwrap().0 / 2;
+        let cent = mid - (w as f32 * 0.5).round() as u16;
 
         let header = (cent, border.1);
         let name = (cent, border.1 + 3);
         let size = (name.0 + widths.0 as u16 + COL_SPACING, border.1 + 3);
         let hash = (size.0 + widths.1 as u16 + COL_SPACING, border.1 + 3);
-        let top_item = (cent - 4, border.1 + 5);
+        let list = (cent - 4, border.1 + 5);
         let footer = (cent, border.1 + n as u16 + 7);
 
         Self {
@@ -66,7 +69,7 @@ impl Layout {
             name,
             size,
             hash,
-            top_item,
+            list,
             footer,
         }
     }
@@ -91,7 +94,7 @@ impl Interface {
         let n = display.len();
         let w = display[0].0.len();
         let lay = Layout::new(widths, n, w, BORDER);
-        let pointer = lay.top_item;
+        let pointer = lay.list;
 
         Ok(Self {
             pointer,
@@ -194,7 +197,7 @@ impl Interface {
     fn refresh_layout(&mut self) {
         let new_lay = Layout::new(self.widths, self.n, self.w, BORDER);
         self.lay = new_lay;
-        self.pointer = self.lay.top_item;
+        self.pointer = self.lay.list;
         self.index = 0;
     }
 
@@ -230,7 +233,7 @@ impl Interface {
                 },
                 d.0
             );
-            let pos = (self.lay.top_item.0, self.lay.top_item.1 + i as u16);
+            let pos = (self.lay.list.0, self.lay.list.1 + i as u16);
             self.write_line(stdout, &pos, line)?;
         }
 
@@ -332,7 +335,7 @@ impl Interface {
             .collect();
 
         let (dl_tx, dl_rx) = mpsc::channel::<()>();
-        thread::spawn(move || download(&filenames, dl_tx).unwrap());
+        thread::spawn(move || mock(&filenames, dl_tx).unwrap());
 
         Ok(dl_rx)
     }
@@ -352,17 +355,9 @@ fn widths(data: &HashMap<String, (u64, String)>) -> (usize, usize, usize) {
     let mut max_hash = 0;
 
     data.iter().for_each(|(name, (size, hash))| {
-        if name.len() > max_name {
-            max_name = name.len();
-        }
-
-        if size.to_string().len() > max_size {
-            max_size = size.to_string().len();
-        }
-
-        if hash.len() > max_hash {
-            max_hash = hash.len();
-        }
+        max_name = max(max_name, name.len());
+        max_size = max(max_size, size.to_string().len());
+        max_hash = max(max_hash, hash.len());
     });
 
     (max_name, max_size, max_hash)
@@ -377,6 +372,7 @@ fn display(
     data.iter().for_each(|(name, (size, hash))| {
         let mut d = String::new();
 
+        // correct alignment in the table
         d.push_str(format!("{:width$}", name, width = widths.0).as_str());
         d.push_str(COL_SEPARATOR);
         d.push_str(format!("{:width$}", size, width = widths.1).as_str());
@@ -400,7 +396,7 @@ fn sigwinch_handler(tx: Sender<()>) -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
-fn download(_filenames: &[String], tx: Sender<()>) -> Result<(), Box<dyn Error>> {
+fn mock(_filenames: &[String], tx: Sender<()>) -> Result<(), Box<dyn Error>> {
     // mock function for sending client requests
     thread::sleep(Duration::from_secs(5));
     tx.send(())?;
